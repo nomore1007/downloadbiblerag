@@ -1,16 +1,36 @@
-import requests
-import json
-from pathlib import Path
-from concurrent.futures import ThreadPoolExecutor, as_completed
-from time import sleep
-import argparse
-import shutil
+#!/usr/bin/env python3
+"""
+download_bibles_rag_clean_auto.py
 
-# -----------------------------------
-# Config
-# -----------------------------------
+- Dynamically reads the wldeh/bible-api bibles.json manifest.
+- Downloads target versions (default: en-kjv, en-asv, en-web, he-wlc, grc-srgnt).
+- Auto-detects verse-text field per-version/book (handles 'text','data', nested objects, lists, dict-of-verses, plain strings).
+- Writes only non-empty files. Uses a .tmp file while writing then renames on success.
+- Cleans existing version directories before starting.
+- Produces SUMMARY.json with list of downloaded books per version.
+
+Usage:
+    python download_bibles_rag_clean_auto.py
+    python download_bibles_rag_clean_auto.py --only en-kjv en-asv
+    python download_bibles_rag_clean_auto.py --targets en-kjv,en-asv --workers 8
+"""
+import argparse
+import json
+import shutil
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from pathlib import Path
+from time import sleep
+from typing import Any, Callable, Optional
+
+import requests
+
+# ----------------------------
+# Config / Canonical books
+# ----------------------------
 BASE_DIR = Path("Bible_Texts_RAG")
-BIBLES_JSON_URL = "https://raw.githubusercontent.com/wldeh/bible-api/refs/heads/main/bibles/bibles.json"
+BIBLES_JSON_URL = (
+    "https://raw.githubusercontent.com/wldeh/bible-api/refs/heads/main/bibles/bibles.json"
+)
 CDN_BASE = "https://cdn.jsdelivr.net/gh/wldeh/bible-api/bibles"
 
 BOOKS = [
@@ -24,147 +44,285 @@ BOOKS = [
     "hebrews","james","1peter","2peter","1john","2john","3john","jude","revelation"
 ]
 
-TARGET_IDS = {"en-kjv", "en-asv", "en-web"}  # you can expand later
-MAX_WORKERS = 6
+# Default targets (can be overridden with --only)
+DEFAULT_TARGET_IDS = {"en-kjv", "en-asv", "en-web", "he-wlc", "grc-srgnt"}
+DEFAULT_MAX_WORKERS = 6
+
+# ----------------------------
+# Utility: robust text finder
+# ----------------------------
+def find_string_in(obj: Any) -> Optional[str]:
+    """Recursively find the first non-empty string inside obj (dict/list/str)."""
+    if obj is None:
+        return None
+    if isinstance(obj, str):
+        s = obj.strip()
+        return s if s else None
+    if isinstance(obj, (list, tuple)):
+        for item in obj:
+            s = find_string_in(item)
+            if s:
+                return s
+        return None
+    if isinstance(obj, dict):
+        # prefer common keys order
+        preferred = ("text", "data", "content", "verseText", "verse_text", "t", "v")
+        for k in preferred:
+            if k in obj:
+                s = find_string_in(obj[k])
+                if s:
+                    return s
+        # otherwise scan values
+        for v in obj.values():
+            s = find_string_in(v)
+            if s:
+                return s
+    return None
 
 
-# -----------------------------------
-# Fetch Bible metadata
-# -----------------------------------
-def get_available_bibles():
-    r = requests.get(BIBLES_JSON_URL)
+def build_extractor_from_sample(sample_item: Any) -> Callable[[Any], str]:
+    """
+    Create an extractor function for verse items based on sample_item.
+    The extractor returns an empty string if no text is found.
+    """
+    # If sample already a string -> direct
+    if isinstance(sample_item, str):
+        return lambda v: v.strip() if isinstance(v, str) else (find_string_in(v) or "")
+
+    # If sample is dict, find best key/value
+    if isinstance(sample_item, dict):
+        # Try preferred keys first
+        preferred_keys = ["text", "data", "content", "verseText", "verse_text", "t", "body"]
+        for key in preferred_keys:
+            val = sample_item.get(key)
+            if isinstance(val, str) and val.strip():
+                return lambda v, k=key: (v.get(k, "").strip() if isinstance(v, dict) else (find_string_in(v) or ""))
+            if isinstance(val, (dict, list)):
+                # if nested contains a string, use recursive finder
+                nested = find_string_in(val)
+                if nested:
+                    return lambda v: (find_string_in(v) or "")
+
+        # Otherwise, pick the first string-valued key
+        for k, val in sample_item.items():
+            if isinstance(val, str) and val.strip():
+                return lambda v, k=k: (v.get(k, "").strip() if isinstance(v, dict) else (find_string_in(v) or ""))
+
+        # fallback to recursive search
+        return lambda v: (find_string_in(v) or "")
+
+    # if list/other -> use recursive finder
+    return lambda v: (find_string_in(v) or "")
+
+
+# ----------------------------
+# HTTP helpers
+# ----------------------------
+def get_bibles_manifest() -> list:
+    r = requests.get(BIBLES_JSON_URL, timeout=15)
     r.raise_for_status()
+    # handle BOM
     return json.loads(r.content.decode("utf-8-sig"))
 
-def find_target_versions(bibles, only=None):
-    targets = []
-    for bible in bibles:
-        bid = bible.get("id", "")
-        if only and bid not in only:
-            continue
-        if bid in TARGET_IDS:
-            targets.append({
-                "id": bid,
-                "name": bible["version"],
-                "abbr": bible.get("localVersionAbbreviation", bid),
-                "lang": bible.get("language", {}).get("code", "unknown")
-            })
-    return targets
+
+def safe_get_json(url: str):
+    try:
+        r = requests.get(url, timeout=12)
+        if r.status_code != 200:
+            return None
+        # some jsons might have BOM but requests.json handles most; be defensive
+        return r.json()
+    except Exception:
+        # return None on any error
+        return None
 
 
-# -----------------------------------
-# Fetch one book (multi-chapter)
-# -----------------------------------
-def fetch_book(version, book_name, output_format="txt", chunk_by="verse"):
-    version_dir = BASE_DIR / version["abbr"]
-    tmpfile = version_dir / f".tmp_{book_name}.writing"
+# ----------------------------
+# Core: fetch & write
+# ----------------------------
+def fetch_book_for_version(version: dict, book: str, output_dir: Path) -> Optional[str]:
+    """
+    Attempt to download book for version. Writes to temporary file and renames only if content found.
+    Returns status string.
+    """
+    tmp = output_dir / f".tmp_{book}.writing"
+    final = output_dir / f"{version['abbr']}_{book.capitalize()}.txt"
     has_content = False
+    extractor = None  # will be set after first successful chapter
 
-    if output_format == "txt":
-        filename = version_dir / f"{version['abbr']}_{book_name.capitalize()}.txt"
-    else:
-        filename = version_dir / f"{version['abbr']}_{book_name.capitalize()}.jsonl"
-
-    with open(tmpfile, "w", encoding="utf-8") as f:
-        if output_format == "txt":
-            f.write(f"### Version: {version['abbr']}\n")
-            f.write(f"### Book: {book_name.capitalize()}\n")
-            f.write(f"### Language: {version['lang']}\n---\n")
+    # open temporary file for streaming
+    with open(tmp, "w", encoding="utf-8") as fh:
+        # write header afterwards (we'll write header even in tmp—it's okay; we'll only keep file if has_content)
+        fh.write(f"### Version: {version['abbr']}\n")
+        fh.write(f"### Book: {book.capitalize()}\n")
+        fh.write(f"### Language: {version.get('lang','unknown')}\n")
+        fh.write("---\n")
 
         chapter = 1
         while True:
-            url = f"{CDN_BASE}/{version['id']}/books/{book_name}/chapters/{chapter}.json"
-            try:
-                r = requests.get(url, timeout=10)
-            except Exception:
-                break
-
-            if r.status_code != 200:
-                break
-
-            try:
-                data = r.json()
-            except Exception:
-                break
+            url = f"{CDN_BASE}/{version['id']}/books/{book}/chapters/{chapter}.json"
+            data = safe_get_json(url)
             if not data:
+                # chapter missing or no content => stop
                 break
 
-            has_content = True
-            if output_format == "jsonl":
-                if chunk_by == "chapter":
-                    chapter_text = " ".join(
-                        v["text"] if isinstance(v, dict) else str(v)
-                        for v in data
-                    )
-                    obj = {
-                        "version": version["abbr"],
-                        "book": book_name.capitalize(),
-                        "chapter": chapter,
-                        "text": chapter_text
-                    }
-                    f.write(json.dumps(obj, ensure_ascii=False) + "\n")
-                else:
-                    for verse_num, verse in enumerate(data, start=1):
-                        text = verse.get("text", "") if isinstance(verse, dict) else str(verse)
-                        obj = {
-                            "version": version["abbr"],
-                            "book": book_name.capitalize(),
-                            "chapter": chapter,
-                            "verse": verse_num,
-                            "text": text.strip()
-                        }
-                        f.write(json.dumps(obj, ensure_ascii=False) + "\n")
+            # If chapter is a dict-of-verses (verseNum->text/dict)
+            if isinstance(data, dict):
+                # sort keys numerically if possible
+                try:
+                    items = sorted(data.items(), key=lambda kv: int(kv[0]))
+                except Exception:
+                    items = list(data.items())
+                # convert to list of verse values for extractor detection
+                verse_values = [v for _, v in items]
+                # build extractor from first verse if not yet built
+                if extractor is None:
+                    extractor = build_extractor_from_sample(verse_values[0] if verse_values else "")
+                for i, v in enumerate(verse_values, start=1):
+                    text = extractor(v).strip() if extractor else (find_string_in(v) or "")
+                    if text:
+                        has_content = True
+                        fh.write(f"{chapter}:{i} {text}\n")
+            # If chapter is a list of verse items (strings or dicts)
+            elif isinstance(data, (list, tuple)):
+                # build extractor from first verse if not yet built
+                if not data:
+                    break
+                if extractor is None:
+                    extractor = build_extractor_from_sample(data[0])
+                for i, verse_item in enumerate(data, start=1):
+                    text = extractor(verse_item).strip() if extractor else (find_string_in(verse_item) or "")
+                    if text:
+                        has_content = True
+                        fh.write(f"{chapter}:{i} {text}\n")
             else:
-                for verse_num, verse in enumerate(data, start=1):
-                    text = verse.get("text", "") if isinstance(verse, dict) else str(verse)
-                    f.write(f"{chapter}:{verse_num} {text.strip()}\n")
+                # Unexpected format — attempt to extract any string
+                text = find_string_in(data)
+                if text:
+                    has_content = True
+                    fh.write(f"{chapter}:1 {text}\n")
+                else:
+                    break
 
             chapter += 1
+            # brief polite pause to avoid hammering (adjust as needed)
+            sleep(0.05)
 
-    # Rename file only if content was written
-    if has_content:
-        tmpfile.rename(filename)
-        return f"✅ {version['abbr']}:{book_name}"
-    else:
-        tmpfile.unlink(missing_ok=True)
-        return f"⏩ {version['abbr']}:{book_name} (no data)"
+    # If no content written, remove tmp and return no-data status
+    if not has_content:
+        try:
+            tmp.unlink(missing_ok=True)
+        except Exception:
+            pass
+        return f"⏩ {version['abbr']}:{book} (no data)"
+    # rename tmp to final file
+    try:
+        tmp.rename(final)
+    except Exception:
+        # fallback: copy then remove
+        shutil.copy(tmp, final)
+        tmp.unlink(missing_ok=True)
+    return f"✅ {version['abbr']}:{book}"
 
 
-# -----------------------------------
-# Main
-# -----------------------------------
+# ----------------------------
+# Orchestration
+# ----------------------------
+def build_targets_from_manifest(manifest: list, target_ids: set, only: Optional[set]) -> list:
+    """Return versions dicts with id,name,abbr,lang filtered by target ids or --only set."""
+    targets = []
+    for entry in manifest:
+        bid = entry.get("id")
+        if only and bid not in only:
+            continue
+        if bid in target_ids:
+            targets.append(
+                {
+                    "id": bid,
+                    "name": entry.get("version"),
+                    "abbr": entry.get("localVersionAbbreviation") or bid,
+                    "lang": entry.get("language", {}).get("code", "unknown"),
+                }
+            )
+    return targets
+
+
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--format", choices=["txt", "jsonl"], default="txt", help="Output format")
-    parser.add_argument("--chunk-by", choices=["verse", "chapter"], default="verse", help="Chunking method for JSONL")
-    parser.add_argument("--only", nargs="*", help="Limit to specific version IDs (e.g. en-kjv en-asv)")
+    parser.add_argument(
+        "--only",
+        nargs="*",
+        help="Limit to specific version IDs (e.g. en-kjv en-asv).",
+    )
+    parser.add_argument("--targets", help="Comma-separated target ids override (e.g. en-kjv,en-asv)")
+    parser.add_argument("--workers", type=int, default=DEFAULT_MAX_WORKERS, help="Thread pool size")
     args = parser.parse_args()
 
-    BASE_DIR.mkdir(exist_ok=True)
-    print("Fetching Bible metadata...")
-    bibles = get_available_bibles()
-    targets = find_target_versions(bibles, args.only)
+    # determine which target set to use
+    target_ids = DEFAULT_TARGET_IDS.copy()
+    if args.targets:
+        target_ids = set(x.strip() for x in args.targets.split(",") if x.strip())
 
-    print(f"\nFound {len(targets)} target versions:")
-    for v in targets:
-        print(f" - {v['abbr']} ({v['name']}) [{v['lang']}]")
+    only_set = set(args.only) if args.only else None
 
+    print("Fetching bibles manifest...")
+    manifest = get_manifest = None
+    try:
+        manifest = get_bibles_manifest()
+    except Exception as exc:
+        print("Failed to fetch manifest:", exc)
+        return
+
+    targets = build_targets_from_manifest(manifest, target_ids, only_set)
+    if not targets:
+        print("No matching target versions found in manifest. Check --only or --targets values.")
+        return
+
+    print(f"Will attempt to download {len(targets)} versions:")
+    for t in targets:
+        print(f" - {t['id']} ({t['name']}) [{t['lang']}]")
+
+    # summary storage
+    summary = {}
+
+    # For each version: wipe directory, then download books concurrently
     for version in targets:
         version_dir = BASE_DIR / version["abbr"]
         if version_dir.exists():
+            print(f"Cleaning existing directory: {version_dir}")
             shutil.rmtree(version_dir)
         version_dir.mkdir(parents=True, exist_ok=True)
 
-        print(f"\n📘 Processing {version['abbr']} ({version['name']})...")
-        tasks = []
-        with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
-            for book in BOOKS:
-                tasks.append(executor.submit(fetch_book, version, book, args.format, args.chunk_by))
-            for future in as_completed(tasks):
-                print(future.result())
-        print(f"✅ Completed {version['abbr']}.\n")
+        print(f"\nProcessing version {version['id']} -> folder {version['abbr']} ...")
+        saved_books = []
+        with ThreadPoolExecutor(max_workers=args.workers) as ex:
+            futures = {ex.submit(fetch_book_for_version, version, book, version_dir): book for book in BOOKS}
+            for fut in as_completed(futures):
+                result = fut.result()
+                print(result)
+                # result format "✅ abbr:book" or "⏩ abbr:book (no data)"
+                if result.startswith("✅"):
+                    # parse book
+                    _, rest = result.split(" ", 1)
+                    abbr_book = rest.strip()
+                    # abbr_book like "abbr:book"
+                    try:
+                        _, bookname = abbr_book.split(":", 1)
+                        saved_books.append(bookname)
+                    except Exception:
+                        pass
 
-    print("📦 All downloads finished. Ready for RAG ingestion!")
+        summary[version["abbr"]] = saved_books
+        print(f"Completed version {version['abbr']}. Saved {len(saved_books)} books.")
+
+    # write summary json
+    summary_path = BASE_DIR / "SUMMARY.json"
+    with open(summary_path, "w", encoding="utf-8") as sjson:
+        json.dump(summary, sjson, ensure_ascii=False, indent=2)
+
+    print(f"\nAll done. Summary saved to {summary_path}")
+    print("Files organized under:", BASE_DIR.resolve())
+
 
 if __name__ == "__main__":
     main()
